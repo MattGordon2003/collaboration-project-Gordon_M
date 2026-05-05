@@ -21,6 +21,10 @@ data <- data |>
       TRUE ~ sex)
   )
 
+# remove useless smoker column
+data <- data |>
+  select(-smoker)
+
 # remove last 4 useless columns
 data <- data |>
   slice(1:(n() - 4))
@@ -55,4 +59,7 @@ data <- data |>
 # convert to factors
 data <- data %>%
   mutate(across(where(is.character), as.factor))
+
+# save cleaned data
+write.csv(data, here("data", "clean_data.csv"), row.names = FALSE)
 
