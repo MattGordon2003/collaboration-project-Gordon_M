@@ -1,5 +1,9 @@
 pacman::p_load(tidyverse, tidymodels, skimr, readxl, here, dplyr, janitor, ggplot2)
 
+data <- read_csv(here("data", "clean_data.csv"))
+
+glimpse(data)
+
 fit_bivariate <- function(x, y, df) {
   df <- df |>
     select(all_of(c(x, y))) |>
@@ -79,3 +83,4 @@ ggplot(data, aes(x = treatment, fill = factor(PR, labels = c("No", "Yes")))) +
     fill = "Positive Response"
   ) +
   theme_minimal()
+

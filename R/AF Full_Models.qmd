@@ -1,0 +1,703 @@
+---
+title: Modelling
+author: Matthew Gordon
+date: today
+format: 
+  html: 
+    self-contained: true
+    df-print: tibble
+editor_options: 
+  chunk_output_type: console
+execute: 
+  warning: false
+  message: false
+  echo: false
+---
+
+```{r, setup, include = FALSE}
+pacman::p_load(ggplot2, tidyverse, tidymodels, readr, here, gglm, patchwork, gt)
+
+data <- read_csv(here("data", "clean_data.csv"))
+
+glimpse(data)
+```
+
+# Cleaning #
+
+```{r, include = FALSE}
+snp_cols <- data |> 
+  select(starts_with("rs")) |> 
+  colnames()
+
+data <- data |> 
+  mutate(
+    treatment = as.factor(treatment),
+    sex = as.factor(sex),
+    across(all_of(snp_cols), as.factor),     
+    PR = as.factor(PR)        # PR is binary → classification problem
+  )
+
+glimpse(data)
+```
+
+# Splitting #
+
+```{r, include = FALSE}
+set.seed(123)
+
+# Why: split data to evaluate model on unseen data
+split_AF <- initial_split(data, strata = treatment)
+
+train_AF <- training(split_AF)
+test_AF  <- testing(split_AF)
+```
+
+```{r, include = FALSE}
+cv_AF <- vfold_cv(train_AF)
+cv_AF
+```
+
+# Workflow #
+
+```{r}
+recipe_AF <- recipe(AF ~ treatment + age + sex + ., data = train_AF) |>
+  step_rm(PR) |>
+  step_zv(all_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>  
+  step_normalize(all_numeric_predictors())
+
+model_AF <- linear_reg(
+  penalty = tune(),
+  mixture = 1   # LASSO
+) |> 
+  set_engine("glmnet")
+
+wf_AF <- workflow(recipe_AF, model_AF)
+```
+
+# Tune Model #
+
+```{r}
+doParallel::registerDoParallel()
+
+AF_grid <- grid_regular(penalty(),  levels = 50)
+
+tuned_AF <- tune_grid(
+  wf_AF,
+  resamples = cv_AF,
+  grid = AF_grid
+)
+```
+
+# Choose Model #
+
+```{r}
+collect_metrics(tuned_AF)
+tuningplot1 <- autoplot(tuned_AF)
+tuningplot1
+
+show_best(tuned_AF, metric = "rmse")
+
+# Current best RMSE model
+best_penalty <- select_best(
+  tuned_AF,
+  metric = "rmse"
+)
+
+best_penalty
+```
+
+```{r}
+# Best RMSE workflow
+wf_best <- wf_AF |> 
+  finalize_workflow(best_penalty)
+
+wf_best
+```
+
+# Fit Final Model #
+
+```{r}
+# Fit best RMSE model
+fit_best <- wf_best |> 
+  fit(train_AF)
+
+fit_best
+
+var_import1 <- fit_best |> 
+  extract_fit_parsnip() |> 
+  vip::vi() |> 
+  filter(Importance > 0.6) |> 
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) |> 
+  ggplot(aes(Importance, Variable)) + 
+  geom_col() +
+  labs(
+    title = "Best RMSE Model",
+    x = "Importance",
+    y = "Predictor"
+  )
+
+var_import1
+```
+
+# Last Fit #
+
+```{r}
+# Best RMSE model performance
+last_fit(wf_best, split_AF) |> 
+  collect_metrics()
+```
+
+
+```{r}
+pred_best <- predict(fit_best, test_AF) |> 
+  bind_cols(test_AF)
+
+lasso_comp_pred_vs_actual <- ggplot(pred_best, aes(x = AF, y = .pred, colour = treatment)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Best RMSE Model by Treatment",
+    x = "Actual AF",
+    y = "Predicted AF",
+    colour = "Treatment"
+  ) +
+  theme_minimal()
+
+lasso_comp_pred_vs_actual
+```
+
+## Simple Lasso Model ##
+
+```{r}
+# =========================
+# SIMPLE TUNED MODEL
+# AF ~ treatment + age
+# =========================
+
+# Recipe
+recipe_simple <- recipe(AF ~ treatment + age, data = train_AF) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+# Model
+model_simple <- linear_reg(
+  penalty = tune(),
+  mixture = 1   # LASSO
+) |> 
+  set_engine("glmnet")
+
+# Workflow
+wf_simple <- workflow(
+  recipe_simple,
+  model_simple
+)
+
+# Tuning grid
+simple_grid <- grid_regular(
+  penalty(),
+  levels = 50
+)
+
+# Tune model
+tuned_simple <- tune_grid(
+  wf_simple,
+  resamples = cv_AF,
+  grid = simple_grid
+)
+
+# View tuning results
+collect_metrics(tuned_simple)
+
+tuningplot2 <- autoplot(tuned_simple)
+tuningplot2
+
+
+show_best(tuned_simple, metric = "rmse")
+
+# Select best penalty
+simple_penalty <- select_best(
+  tuned_simple,
+  metric = "rmse"
+)
+
+simple_penalty
+
+# Finalize workflow
+wf_simple_best <- wf_simple |> 
+  finalize_workflow(simple_penalty)
+
+# Fit final model
+fit_simple_best <- wf_simple_best |> 
+  fit(train_AF)
+
+fit_simple_best
+
+# Variable importance
+var_import2 <- fit_simple_best |> 
+  extract_fit_parsnip() |> 
+  vip::vi() |> 
+  filter(Importance > 0) |> 
+  mutate(
+    Variable = fct_reorder(Variable, Importance)
+  ) |> 
+  ggplot(aes(Importance, Variable, fill = Variable)) + 
+  geom_col() +
+  labs(
+    title = "Simple Tuned Model Importance",
+    x = "Importance",
+    y = "Predictor"
+  ) +
+  theme_minimal()
+
+var_import2
+
+# Test set performance
+last_fit(wf_simple_best, split_AF) |> 
+  collect_metrics()
+
+# Predictions
+pred_simple <- predict(fit_simple_best, test_AF) |> 
+  bind_cols(test_AF)
+
+
+
+# Create prediction grid
+plot_data <- expand_grid(
+  age = seq(
+    min(data$age, na.rm = TRUE),
+    max(data$age, na.rm = TRUE),
+    length.out = 100
+  ),
+  treatment = levels(data$treatment)
+)
+
+# Predict from fitted model
+plot_data <- plot_data |> 
+  bind_cols(
+    predict(fit_simple_best, new_data = plot_data)
+  )
+
+AF_vs_age_simp_lasso <- ggplot() +
+  geom_point(
+    data = data,
+    aes(x = age, y = AF, colour = treatment),
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = plot_data,
+    aes(x = age, y = .pred, colour = treatment),
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Predicted AF vs Age",
+    x = "Age",
+    y = "AF",
+    colour = "Treatment"
+  ) +
+  theme_minimal()
+
+AF_vs_age_simp_lasso
+
+
+pred_vs_actual_simp_lasso <- ggplot(pred_simple, aes(x = AF, y = .pred, colour = treatment)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Simple Model by Treatment",
+    x = "Actual AF",
+    y = "Predicted AF",
+    colour = "Treatment"
+  ) +
+  theme_minimal()
+
+pred_vs_actual_simp_lasso
+```
+
+## Simple LR Model ##
+
+```{r}
+# =========================
+# SIMPLE LINEAR REGRESSION
+# AF ~ treatment + age
+# =========================
+
+# Recipe
+recipe_simple <- recipe(AF ~ treatment + age, data = train_AF) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+# Model
+model_simple <- linear_reg() |> 
+  set_engine("lm")
+
+# Workflow
+wf_simple <- workflow(
+  recipe_simple,
+  model_simple
+)
+
+# Fit model
+fit_simple <- wf_simple |> 
+  fit(train_AF)
+
+fit_simple
+
+fit_simple |> 
+  extract_fit_parsnip() |> 
+  tidy()
+
+pred_simple <- predict(fit_simple, test_AF) |> 
+  bind_cols(test_AF)
+
+pred_vs_actual_simp_lr <- ggplot(pred_simple, aes(AF, .pred, colour = treatment)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Simple Linear Regression",
+    x = "Actual AF",
+    y = "Predicted AF"
+  ) +
+  theme_minimal()
+
+pred_vs_actual_simp_lr
+
+plot_data <- expand_grid(
+  age = seq(
+    min(data$age, na.rm = TRUE),
+    max(data$age, na.rm = TRUE),
+    length.out = 100
+  ),
+  treatment = levels(data$treatment)
+)
+
+plot_data <- plot_data |> 
+  bind_cols(
+    predict(fit_simple, new_data = plot_data)
+  )
+
+AF_vs_age_simp_lm <- ggplot() +
+  geom_point(
+    data = data,
+    aes(age, AF, colour = treatment),
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = plot_data,
+    aes(age, .pred, colour = treatment),
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Predicted AF vs Age",
+    x = "Age",
+    y = "AF"
+  ) +
+  theme_minimal()
+
+AF_vs_age_simp_lm
+
+```
+
+## MODEL COMPARISON ##
+
+```{r}
+# =========================
+# MODEL PERFORMANCE COMPARISON
+# =========================
+
+# Complex SNP LASSO
+metrics_best <- last_fit(wf_best, split_AF) |> 
+  collect_metrics()
+
+# Simple LASSO
+metrics_simple_lasso <- last_fit(wf_simple_best, split_AF) |> 
+  collect_metrics()
+
+# Simple Linear Regression
+metrics_simple_lm <- last_fit(wf_simple, split_AF) |> 
+  collect_metrics()
+
+# Compare RMSE and R²
+tibble(
+  Model = c(
+    "Complex SNP LASSO",
+    "Simple LASSO",
+    "Simple Linear Regression"
+  ),
+  
+  RMSE = c(
+    metrics_best |> 
+      filter(.metric == "rmse") |> 
+      pull(.estimate),
+    
+    metrics_simple_lasso |> 
+      filter(.metric == "rmse") |> 
+      pull(.estimate),
+    
+    metrics_simple_lm |> 
+      filter(.metric == "rmse") |> 
+      pull(.estimate)
+  ),
+  
+  R_squared = c(
+    metrics_best |> 
+      filter(.metric == "rsq") |> 
+      pull(.estimate),
+    
+    metrics_simple_lasso |> 
+      filter(.metric == "rsq") |> 
+      pull(.estimate),
+    
+    metrics_simple_lm |> 
+      filter(.metric == "rsq") |> 
+      pull(.estimate)
+  )
+)
+```
+
+## Check Assumptions ##
+
+```{r}
+lm_engine <- fit_simple |> 
+  extract_fit_engine()
+
+gglm_simp_lm <- gglm(lm_engine)
+gglm_simp_lm
+```
+
+## Interaction Model ##
+
+```{r}
+# =========================
+# INTERACTION LINEAR MODEL
+# AF ~ treatment * age
+# =========================
+
+# Recipe
+recipe_interact <- recipe(
+  AF ~ treatment + age,
+  data = train_AF
+) |>
+  step_impute_mean(age) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_interact(
+    terms = ~ age:starts_with("treatment_")
+  )
+
+# Model
+model_interact <- linear_reg() |> 
+  set_engine("lm")
+
+# Workflow
+wf_interact <- workflow(
+  recipe_interact,
+  model_interact
+)
+
+# Fit model
+fit_interact <- wf_interact |> 
+  fit(train_AF)
+
+fit_interact
+
+# =========================
+# VIEW COEFFICIENTS
+# =========================
+
+fit_interact |> 
+  extract_fit_parsnip() |> 
+  tidy()
+
+# =========================
+# TEST SET PREDICTIONS
+# =========================
+
+pred_interact <- predict(fit_interact, test_AF) |> 
+  bind_cols(test_AF)
+
+# =========================
+# MODEL PERFORMANCE
+# =========================
+
+pred_interact |> 
+  metrics(
+    truth = AF,
+    estimate = .pred
+  )
+
+# =========================
+# PREDICTED VS ACTUAL AF
+# =========================
+
+pred_vs_actual_inter <- ggplot(pred_interact, aes(x = AF, y = .pred, colour = treatment)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Interaction Model",
+    x = "Actual AF",
+    y = "Predicted AF",
+    colour = "Treatment"
+  ) +
+  theme_minimal()
+
+pred_vs_actual_inter
+
+# =========================
+# PREDICTED AF VS AGE
+# =========================
+
+plot_interact <- expand_grid(
+  age = seq(
+    min(data$age, na.rm = TRUE),
+    max(data$age, na.rm = TRUE),
+    length.out = 200
+  ),
+  treatment = levels(data$treatment)
+)
+
+plot_interact <- plot_interact |> 
+  bind_cols(
+    predict(fit_interact, new_data = plot_interact)
+  )
+
+AF_vs_age_inter <- ggplot() +
+  
+  geom_point(
+    data = data,
+    aes(x = age, y = AF, colour = treatment),
+    alpha = 0.4
+  ) +
+  
+  geom_line(
+    data = plot_interact,
+    aes(x = age, y = .pred, colour = treatment),
+    linewidth = 1.3
+  ) +
+  
+  labs(
+    title = "Interaction Model: AF vs Age",
+    x = "Age",
+    y = "Predicted AF",
+    colour = "Treatment"
+  ) +
+  
+  theme_minimal()
+
+AF_vs_age_inter
+
+#check assumptions
+# Extract underlying lm object
+interact_engine <- fit_interact |> 
+  extract_fit_engine()
+
+gglm_inter <- gglm(interact_engine)
+gglm_inter
+
+```
+
+## Plots for Report ##
+
+```{r}
+gglm_simp_lm
+
+pred_vs_actual_simp_lr / pred_vs_actual_inter
+
+AF_vs_age_simp_lm / AF_vs_age_inter
+
+gglm_inter
+```
+
+## Compare Models ##
+
+```{r}
+# =========================
+# MODEL COMPARISON TABLE
+# =========================
+
+# Extract lm objects
+lm_simple <- fit_simple |> 
+  extract_fit_engine()
+
+lm_interact <- fit_interact |> 
+  extract_fit_engine()
+
+# Build comparison table
+model_table <- tibble(
+  Model = c(
+    "Simple Linear Regression",
+    "Interaction Linear Regression"
+  ),
+  
+  AIC = c(
+    AIC(lm_simple),
+    AIC(lm_interact)
+  ),
+  
+  R_squared = c(
+    summary(lm_simple)$r.squared,
+    summary(lm_interact)$r.squared
+  ),
+  
+  Adjusted_R_squared = c(
+    summary(lm_simple)$adj.r.squared,
+    summary(lm_interact)$adj.r.squared
+  )
+)
+
+# Create gt table
+model_table |> 
+  gt() |> 
+  
+  fmt_number(
+    columns = c(AIC, R_squared, Adjusted_R_squared),
+    decimals = 3
+  ) |> 
+  
+  cols_label(
+    Model = "Model",
+    AIC = "AIC",
+    R_squared = "R²",
+    Adjusted_R_squared = "Adjusted R²"
+  ) |> 
+  
+  tab_header(
+    title = "Linear Model Comparison",
+    subtitle = "Simple vs Interaction Models"
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
