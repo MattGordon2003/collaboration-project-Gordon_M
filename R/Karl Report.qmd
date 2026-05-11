@@ -19,10 +19,6 @@ pacman::p_load(ggplot2, tidyverse, tidymodels, readr, here, gglm, patchwork, gt,
 
 data <- read_csv(here("data", "clean_data.csv"))
 
-glimpse(data)
-```
-
-```{r, include = FALSE}
 snp_cols <- data |> 
   select(starts_with("rs")) |> 
   colnames()
@@ -32,20 +28,23 @@ data <- data |>
     treatment = as.factor(treatment),
     sex = as.factor(sex),
     across(all_of(snp_cols), as.factor),     
-    PR = as.factor(PR)        # PR is binary → classification problem
+    PR = factor(PR, levels = c("1", "0"))
   )
-
-glimpse(data)
 ```
 
 ```{r, include = FALSE}
 set.seed(123)
 
-# Why: split data to evaluate model on unseen data
 split_AF <- initial_split(data, strata = treatment)
 
 train_AF <- training(split_AF)
 test_AF  <- testing(split_AF)
+
+
+split_PR <- initial_split(data, strata = PR)
+
+train_PR <- training(split_PR)
+test_PR  <- testing(split_PR)
 ```
 
 ```{r, include = FALSE}
@@ -73,12 +72,11 @@ wf_simple <- workflow(
 fit_simple <- wf_simple |> 
   fit(train_AF)
 
-fit_simple
-
 fit_simple |> 
   extract_fit_parsnip() |> 
   tidy()
 
+# Test model
 pred_simple <- predict(fit_simple, test_AF) |> 
   bind_cols(test_AF)
 
@@ -128,9 +126,7 @@ AF_vs_age_simp_lm <- ggplot() +
     y = "AF"
   ) +
   theme_minimal()
-```
 
-```{r}
 lm_engine <- fit_simple |> 
   extract_fit_engine()
 
@@ -171,18 +167,7 @@ fit_interact <- wf_interact |>
 
 fit_interact
 
-# =========================
-# VIEW COEFFICIENTS
-# =========================
-
-fit_interact |> 
-  extract_fit_parsnip() |> 
-  tidy()
-
-# =========================
-# TEST SET PREDICTIONS
-# =========================
-
+# Make predictions
 pred_interact <- predict(fit_interact, test_AF) |> 
   bind_cols(test_AF)
 
@@ -204,6 +189,7 @@ pred_vs_actual_inter <- ggplot(pred_interact, aes(x = AF, y = .pred, colour = tr
     colour = "Treatment"
   ) +
   theme_minimal()
+
 
 # =========================
 # PREDICTED AF VS AGE
@@ -247,7 +233,6 @@ AF_vs_age_inter <- ggplot() +
   theme_minimal()
 
 #check assumptions
-# Extract underlying lm object
 interact_engine <- fit_interact |> 
   extract_fit_engine()
 
@@ -312,53 +297,248 @@ model_gt <- model_table |>
   )
 ```
 
+```{r}
+# ===================
+# Full Logistic Model
+# PR ~ treatment + age
+# ===================
+
+# Workflow
+recipe_PR <- recipe(PR ~ treatment + age, data = train_PR) |>
+  step_impute_mean(age) |>
+  step_center(age) |>
+  step_dummy(all_nominal_predictors())
+
+model_PR <- logistic_reg() |> 
+  set_engine("glm") |>
+  set_mode("classification")
+
+wf_PR <- workflow(recipe_PR,model_PR)
+
+# Fit Model
+fit_PR <- fit(wf_PR, train_PR)
+
+# Testing
+pred_PR <- predict(fit_PR, test_PR, type = "prob") |>
+  bind_cols(predict(fit_PR, test_PR, type = "class")) |>
+  bind_cols(test_PR |> select(PR, age, treatment))
+
+# Visualise
+plot_PR <- expand_grid(
+  age = seq(
+    min(data$age, na.rm = TRUE),
+    max(data$age, na.rm = TRUE),
+    length.out = 200
+  ),
+  treatment = factor(c("A", "B", "C"), levels = levels(data$treatment))
+)
+
+plot_PR <- plot_PR |> 
+  bind_cols(
+    predict(fit_PR, new_data = plot_PR, type = "prob")
+  )
+
+ggplot(plot_PR, aes(x = age, y = .pred_1, colour = treatment, linetype = treatment)) +
+  geom_line(linewidth = 1.3) +
+  labs(
+    title = "Predicted Probability of PR",
+    x = "Age",
+    y = "P(PR = 1)",
+    colour = "Treatment",
+    linetype = "Treatment"
+  ) +
+  theme_minimal()
+
+# Metrics
+roc_df <- roc_curve(pred_PR, truth = PR, .pred_1)
+auc_val <- roc_auc(pred_PR, truth = PR, .pred_1)$.estimate
+```
+
+```{r}
+# ===================
+# Simple Logistic Model
+# PR ~ treatment
+# ===================
+
+recipe_PR_simple <- recipe(PR ~ treatment, data = train_PR) |>
+  step_dummy(all_nominal_predictors())
+
+wf_PR_simple <- wf_PR |>
+  update_recipe(recipe_PR_simple)
+
+fit_PR_simple <- fit(wf_PR_simple, train_PR)
+
+pred_PR_simple <- predict(fit_PR_simple, test_PR, type = "prob") |>
+  bind_cols(predict(fit_PR_simple, test_PR, type = "class")) |>
+  bind_cols(test_PR)
+
+metrics(pred_PR_simple, truth = PR, estimate = .pred_class)
+
+roc_auc(pred_PR_simple, truth = PR, .pred_1)
+```
+
+```{r}
+# =================
+# PR Model Comparison
+# =================
+
+# ROC Curves
+roc1 <- roc_curve(pred_PR, truth = PR, .pred_1) |> mutate(model = "Age + Treatment")
+roc2 <- roc_curve(pred_PR_simple, truth = PR, .pred_1) |> mutate(model = "Treatment Only")
+
+bind_rows(roc1, roc2) |>
+  ggplot(aes(x = 1 - specificity, y = sensitivity, colour = model)) +
+  geom_path(linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  theme_minimal()
+
+# Comparison Metrics
+model_compare <- tibble(
+  Model = c("Age + Treatment", "Treatment Only"),
+  
+  Accuracy = c(
+    accuracy(pred_PR, truth = PR, estimate = .pred_class)$.estimate,
+    accuracy(pred_PR_simple, truth = PR, estimate = .pred_class)$.estimate
+  ),
+  
+  Sensitivity = c(
+    sens(pred_PR, truth = PR, estimate = .pred_class)$.estimate,
+    sens(pred_PR_simple, truth = PR, estimate = .pred_class)$.estimate
+  ),
+  
+  Specificity = c(
+    spec(pred_PR, truth = PR, estimate = .pred_class)$.estimate,
+    spec(pred_PR_simple, truth = PR, estimate = .pred_class)$.estimate
+  ),
+  
+  ROC_AUC = c(
+    roc_auc(pred_PR, truth = PR, .pred_1)$.estimate,
+    roc_auc(pred_PR_simple, truth = PR, .pred_1)$.estimate
+  )
+)
+
+model_compare |>
+  mutate(across(where(is.numeric), round, 3)) |>
+  gt()
+```
+
+```{r}
+# ================
+# SNPs are useless
+# ================
+
+snp_cols_valid <- snp_cols[
+  map_lgl(snp_cols, ~ n_distinct(data[[.x]], na.rm = TRUE) > 1)
+]
+
+snp_tests <- map_df(snp_cols_valid, function(snp) {
+  
+  formula <- as.formula(paste("PR ~", snp))
+  
+  model <- glm(
+    formula,
+    data = data,
+    family = "binomial"
+  )
+  
+  tidy(model) |> 
+    filter(term != "(Intercept)") |>
+    mutate(snp = snp)
+})
+
+snp_tests <- snp_tests |> 
+  mutate(p_adj = p.adjust(p.value, method = "fdr")) |>
+  arrange(p_adj)
+
+top_snps <- snp_tests |>
+  slice_head(n = 5) |>
+  select(snp, estimate, std.error, statistic, p.value, p_adj)
+
+top_snps |>
+  gt() |>
+  cols_label(
+    snp = "SNP",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    statistic = "Z-value",
+    p.value = "p-value",
+    p_adj = "Adjusted p-value"
+  ) |>
+  fmt_number(
+    columns = c(estimate, std.error, statistic),
+    decimals = 3
+  ) |>
+  fmt_number(
+    columns = c(p.value, p_adj),
+    decimals = 3
+  ) |>
+  tab_header(
+    title = "Top 5 SNPs Associated with Positive Response",
+    subtitle = "Ranked by adjusted p-value"
+  )
+```
+
 ## Introduction
 
 The dataset consists of 100 patients and includes demographic characteristics such as age, sex, smoking status, and treatment group, as well as 51 genetic single nucleotide polymorphisms (SNPs). There are two outcome variables: Activating Factor (AF), a continuous measure of response, and Positive Response (PR), a binary indicator of treatment effectiveness.
 
 The dataset was obtained from a collaborator and provided via email.
 
-The key variables of interest were:
-
--   Treatment: a class; A, B or C
+The key variable of interest was the treatment group; A, B or C. We are also interested in the effects of
 
 -   Age: the age in years of the participant, ranging from 25 to 45
 
+-   Sex: male or female
+
 -   SNPs: a set of 51 genetic predictors, recorded as categorical genotype values
 
-The key research question was to assess the effect of treatment group on AF and the probability of a PR, while accounting for demographic characteristics (age, sex, smoking status) and genetic variation (SNPs).
+The key research question was to assess the effect of treatment group on AF and the probability of a PR, while accounting for demographic characteristics (age, sex) and genetic variation (SNPs).
 
 ## Methods
 
-```{r}
-#| label: fig-simple-diagnostics
-#| fig-cap: "Diagnostic plots for the simple linear regression model predicting Activating Factor (AF) from centred age and treatment. These plots are used to assess model assumptions, including residual patterns, normality, and influential observations."
+#### Cleaning
 
-gglm_simp_lm
-```
+The raw dataset was imported from the Excel file FITFR-final-data-v3.xlsx. The first row of the spreadsheet contained the variable names, so this row was promoted to column headers using row_to_names().
 
-```{r}
-#| label: fig-predicted-actual-comparison
-#| fig-cap: "Comparison of predicted and actual Activating Factor (AF) values for the simple and interaction linear regression models. Points closer to the dashed 1:1 line indicate better predictive agreement between observed and model-predicted AF."
+The smoker column was removed, as well as the last four rows of the dataset, as they did not contain any useful information.
 
-Plot_pred_vs_actual <- pred_vs_actual_simp_lr / pred_vs_actual_inter
-Plot_pred_vs_actual
-```
+Illogical age values such as -99 were replaced with NA. The response variable PR was converted "yes", "no" strings into a binary "1", "0".
 
-```{r}
-#| label: fig-af-age-comparison
-#| fig-cap: "Predicted Activating Factor (AF) across age for the simple and interaction linear regression models. The interaction model allows the relationship between age and AF to differ by treatment group."
+The sex and treatment columns were standardised to "male", "female" and "A", "B", "C", so that inconsistent entries didn't appear as a different chatagory.
 
-Plot_AF_vs_age <- AF_vs_age_simp_lm / AF_vs_age_inter
-Plot_AF_vs_age
-```
+Finally, the variables age, ID and AF were converted to numeric format, and the remaining character variables were converted to factors.
 
-```{r}
-#| label: fig-interaction-diagnostics
-#| fig-cap: "Diagnostic plots for the interaction linear regression model predicting Activating Factor (AF) from centred age, treatment, and age-by-treatment interaction terms. These plots are used to assess whether the fitted model satisfies linear regression assumptions."
+This cleaned version of the dataset was saved as clean_data.csv to not override the original dataset and have a consistent version of the data to load for modelling. Upon loading this dataset into RStudio for modelling, the chategorical variables need to be converted back into factors as csv files do not store this structure.
 
-gglm_inter
-```
+#### EDA
+
+#### Activating Factor (AF) Models
+
+The simple AF model used a linear regression approach to estimate the effect of treatment group and age on AF. An ordinary least squares linear regression was fitted using the "lm" engine by linear_reg(). This model was selected as EDA indicated a linear relationship.
+
+In pre-processing to fit the model, the treatment variable was converted into a dummy variable, since linear regression requires numeric inputs. Treatment group A is used as the reference category and the treatment coefficients represent the differences in AF relative to group A. Age was centred to better interpretability of the model, with the intercept now representing expected AF for the reference treatment group at the average age as opposed to age zero, which is meaningless to us. We split our data into a training set and a test set, using the seed (123) and stratifying over treatment.
+
+The recipe and model were combined into a workflow to ensure that the same preprocessing steps were applied consistently during fitting and prediction. We fit the model using the training data, before generating predictions to assess the performance of the model against the testing data.
+
+This model was extended to add an interaction term between age and treatment group to assess whether the effect of age on AF is different across treatment groups. We used the same model type and engine as the simple AF model, reusing the training and testing split from before.
+
+In pre-processing, missing values in the age data were replaced with the mean age using impute_mean(). We also once again centred the age for interpretability and converted treatment to dummy variables. Finally, interaction terms were added between and each of the treatment dummy variables. The recipe and model were combined in a workflow for consistency across fitting and testing.
+
+We fitted the model with the training data and generated predictions to evaluate performance using the test set. We compared the performance of our two linear regression models by comparing performance metrics, AIC, $R^2$ and adjusted $R^2$, as well as plotting the predicted AF values against the actual AF values. Finally, for a visual representation of the relationship, we plotted a scatter of the AF against age with the slopes from our model to compare. The model assumptions were assessed by the plots generated by the gglm() in the gglm package.
+
+A Lasso model was also considered due to the large number of potential predictors, mainly the SNPs, however it was found that these SNPs had no significant effect so a simpler model was favoured.
+
+#### Positive Response (PR) Models
+
+For PR, logistic regression models were used because the response variable was binary, with PR coded as either 0 or 1. The full PR model estimated the probability of a positive response as a function of treatment group and age. A logistic regression model was fitted using the "glm" engine via logistic_reg(), with classification mode specified because the outcome was categorical.
+
+In preprocessing, missing age values were replaced with the mean age using step_impute_mean(age). Age was then centred to improve interpretability, so that treatment effects were interpreted at the average age. The treatment variable was converted into dummy variables, with treatment group A used as the reference category. The recipe and logistic regression model were combined into a workflow so that preprocessing was applied consistently during both fitting and prediction.
+
+The model was fitted using the training data, and predicted probabilities and predicted classes were generated for the test data. Model performance was assessed using classification metrics including accuracy, sensitivity, specificity, and ROC AUC. The ROC curve was used to evaluate how well the model discriminated between positive and negative responses across classification thresholds.
+
+A simpler logistic regression model was also fitted using treatment group alone as the predictor. This model reused the same workflow structure, with the recipe updated to include only treatment as a predictor. The treatment-only model was compared with the age-and-treatment model using ROC curves and summary performance metrics. This comparison was used to assess whether including age improved predictive performance.
+
+The influence of genetic SNPs on PR was assessed using a series of univariate logistic regression models, where each SNP was tested individually against PR. SNPs with no variation across patients were removed prior to modelling because they cannot explain differences in response. P-values were adjusted using the false discovery rate method to account for multiple testing across SNPs. The top five SNPs were summarised in a table ranked by adjusted p-value. As no SNPs showed strong evidence of association after adjustment, a simpler PR model was favoured over a more complex SNP-based model.
 
 ## Results
 
